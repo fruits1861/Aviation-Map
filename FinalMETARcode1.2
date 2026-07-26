@@ -1,0 +1,1075 @@
+/*
+  ESP32 16-Airport Aviation Weather Map
+  =====================================
+
+  Controller:
+    ESP32-WROOM-32 / ESP32 Dev Module
+
+  LED hardware:
+    16 WS2811 RGB LED modules
+    Data input connected to ESP32 GPIO18
+    RGB color order
+    800 kHz timing
+
+  Required libraries:
+    1. Adafruit NeoPixel
+    2. ArduinoJson version 7
+
+  Architecture:
+    Data-driven. Everything the board displays is defined in const data
+    tables near the top of the file:
+
+      Airports            — which airport each physical LED represents
+      HazardCodeTable     — which METAR codes raise which hazard flags
+      HazardDisplayTable  — hazard priority order and what each one shows
+      DisplayModeTable    — solid vs. blink patterns (colors + blink rate)
+      FlightCategoryTable — VFR/MVFR/IFR/LIFR colors
+
+    The functions below the tables only walk them. Changing what the
+    board shows (new hazard, different color, different blink speed,
+    different priority order) means editing a table row, not a function.
+
+    Connectivity is non-blocking: Wi-Fi and the weather update cycle each
+    run as a small state machine polled from loop(), so the blink
+    animation never stalls. The only delay() left is the one-shot
+    startup test.
+
+  Lighting priority (top row of HazardDisplayTable wins first):
+    1. Thunderstorm        = rapidly flashing yellow
+    2. Freezing rain       = alternating red and white
+    3. Ice pellets         = alternating purple and white
+    4. Snow                = solid white
+    5. Rain or drizzle     = solid turquoise
+    6. Wind >= 25 knots    = solid yellow
+    7. LIFR                = solid magenta
+    8. IFR                 = solid red
+    9. MVFR                = solid blue
+   10. VFR                 = solid green
+   11. Missing/error       = dim orange
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+
+// ── Wi-Fi settings ──────────────────────────────────────────────────────────
+// Replace these with your Wi-Fi information.
+
+static const char* WiFiName     = "YOUR WIFI NAME";
+static const char* WiFiPassword = "YOUR WIFI PASSWORD";
+
+// ── LED hardware ────────────────────────────────────────────────────────────
+
+static constexpr int     LEDPin        = 18;
+static constexpr int     LEDCount      = 16;
+static constexpr uint8_t LEDBrightness = 25;
+
+Adafruit_NeoPixel Pixels(LEDCount, LEDPin, NEO_RGB + NEO_KHZ800);
+
+// ── Timing / thresholds ─────────────────────────────────────────────────────
+
+static constexpr unsigned long WeatherUpdateInterval = 5UL * 60UL * 1000UL; // 5 minutes
+static constexpr unsigned long BlinkInterval         = 150UL;               // ms per blink step
+static constexpr unsigned long WiFiConnectTimeout    = 30000UL;             // ms before giving up
+static constexpr int           WindAlertKnots        = 25;                  // sustained or gust
+
+// ── Color palette ───────────────────────────────────────────────────────────
+// Packed 0x00RRGGBB values. Adafruit_NeoPixel::Color only packs bytes — the
+// RGB→wire-order swap happens later inside setPixelColor — so these are safe
+// to build at global scope, before Pixels.begin().
+
+static const uint32_t ColorOff          = Adafruit_NeoPixel::Color(0, 0, 0);
+static const uint32_t ColorVFR          = Adafruit_NeoPixel::Color(0, 255, 0);     // green
+static const uint32_t ColorMVFR         = Adafruit_NeoPixel::Color(0, 0, 255);     // blue
+static const uint32_t ColorIFR          = Adafruit_NeoPixel::Color(255, 0, 0);     // red
+static const uint32_t ColorLIFR         = Adafruit_NeoPixel::Color(255, 0, 255);   // magenta
+static const uint32_t ColorWind         = Adafruit_NeoPixel::Color(255, 255, 0);   // yellow
+static const uint32_t ColorRain         = Adafruit_NeoPixel::Color(0, 255, 180);   // turquoise
+static const uint32_t ColorSnow         = Adafruit_NeoPixel::Color(255, 255, 255); // white
+static const uint32_t ColorPurple       = Adafruit_NeoPixel::Color(170, 0, 255);
+static const uint32_t ColorThunderstorm = Adafruit_NeoPixel::Color(255, 210, 0);   // storm yellow
+static const uint32_t ColorError        = Adafruit_NeoPixel::Color(65, 15, 0);     // dim orange
+
+// ── Airport table ───────────────────────────────────────────────────────────
+// Array index = physical LED position. Index 0 = LED 1, index 15 = LED 16.
+
+static const char* Airports[LEDCount] = {
+  "KL35", // LED 1
+  "KONT", // LED 2
+  "KRAL", // LED 3
+  "KCNO", // LED 4
+  "KSNA", // LED 5
+  "KHMT", // LED 6
+  "KF70", // LED 7
+  "KOKB", // LED 8
+  "KCRQ", // LED 9
+  "KRNM", // LED 10
+  "KSEE", // LED 11
+  "KMYF", // LED 12
+  "KSAN", // LED 13
+  "KSDM", // LED 14
+  "KL08", // LED 15
+  "KPSP"  // LED 16
+};
+
+// ── METAR weather-code table ────────────────────────────────────────────────
+// Every valid two-letter present-weather code. Weather tokens are built only
+// from complete pairs of these (TSRA = TS + RA), which is what lets us reject
+// airport IDs like KRAL (KR + AL — neither is valid) as false rain matches.
+
+static const char* ValidWeatherCodes[] = {
+  // Descriptors
+  "MI", "PR", "BC", "DR", "BL", "SH", "TS", "FZ",
+
+  // Precipitation
+  "DZ", "RA", "SN", "SG", "IC", "PL", "GR", "GS", "UP",
+
+  // Obscuration
+  "BR", "FG", "FU", "VA", "DU", "SA", "HZ", "PY",
+
+  // Other
+  "PO", "SQ", "FC", "SS", "DS"
+};
+
+static constexpr int ValidWeatherCodeCount =
+  sizeof(ValidWeatherCodes) / sizeof(ValidWeatherCodes[0]);
+
+// ── Hazard flags ────────────────────────────────────────────────────────────
+// Bitmask so one METAR can carry several hazards at once (e.g. +TSRA raises
+// both Thunderstorm and Rain); HazardDisplayTable priority decides the winner.
+
+enum EWeatherHazard : uint8_t
+{
+  Hazard_None         = 0,
+  Hazard_Rain         = 1 << 0,
+  Hazard_Snow         = 1 << 1,
+  Hazard_IcePellets   = 1 << 2,
+  Hazard_FreezingRain = 1 << 3,
+  Hazard_Thunderstorm = 1 << 4
+};
+
+// ── Hazard-code detection table ─────────────────────────────────────────────
+// Substring of a validated weather token → hazard flag it raises. Rows are
+// OR'd together, not first-match, so FZRA correctly raises both FreezingRain
+// (via "FZRA") and Rain (via "RA") and priority sorts it out later.
+
+struct FHazardCodeRow
+{
+  const char* Code;   // substring searched for inside the weather token
+  uint8_t     Hazard; // EWeatherHazard flag raised when found
+};
+
+static const FHazardCodeRow HazardCodeTable[] = {
+  { "TS",   Hazard_Thunderstorm },
+  { "FZRA", Hazard_FreezingRain },
+  { "FZDZ", Hazard_FreezingRain }, // freezing drizzle displays as freezing rain
+  { "PL",   Hazard_IcePellets   },
+  { "SN",   Hazard_Snow         },
+  { "RA",   Hazard_Rain         },
+  { "DZ",   Hazard_Rain         }  // drizzle displays as rain
+};
+
+static constexpr int HazardCodeCount =
+  sizeof(HazardCodeTable) / sizeof(HazardCodeTable[0]);
+
+// ── Display modes ───────────────────────────────────────────────────────────
+
+enum class EDisplayMode : uint8_t
+{
+  Solid = 0,
+  Thunderstorm,
+  FreezingRain,
+  IcePellets
+};
+
+// One row per EDisplayMode value, indexed by the enum. Solid reads its color
+// from the per-LED StoredColors array; flashing modes alternate between the
+// row's two colors every (StepDivisor * BlinkInterval) milliseconds.
+
+struct FDisplayModeRow
+{
+  bool     bUsesStoredColor; // true = per-LED color, ignore the fields below
+  uint32_t PrimaryColor;     // shown when the blink phase is even
+  uint32_t SecondaryColor;   // shown when the blink phase is odd
+  uint8_t  StepDivisor;      // blink phase = (BlinkStep / StepDivisor) % 2
+};
+
+static const FDisplayModeRow DisplayModeTable[] = {
+  /* Solid        */ { true,  ColorOff,          ColorOff,  1 },
+  /* Thunderstorm */ { false, ColorThunderstorm, ColorOff,  1 }, // rapid yellow flash
+  /* FreezingRain */ { false, ColorIFR,          ColorSnow, 4 }, // slow red/white
+  /* IcePellets   */ { false, ColorPurple,       ColorSnow, 4 }  // slow purple/white
+};
+
+// ── Hazard display table ────────────────────────────────────────────────────
+// Walked top to bottom; the first row whose hazard flag is set wins, so ROW
+// ORDER IS THE PRIORITY ORDER. Wind and flight category are handled after
+// this table because they aren't hazard flags (wind is a threshold check,
+// flight category is the fallback).
+
+struct FHazardDisplayRow
+{
+  uint8_t      Hazard;     // EWeatherHazard flag this row responds to
+  EDisplayMode Mode;       // display mode to assign
+  uint32_t     SolidColor; // only used when Mode == EDisplayMode::Solid
+};
+
+static const FHazardDisplayRow HazardDisplayTable[] = {
+  { Hazard_Thunderstorm, EDisplayMode::Thunderstorm, ColorOff  },
+  { Hazard_FreezingRain, EDisplayMode::FreezingRain, ColorOff  },
+  { Hazard_IcePellets,   EDisplayMode::IcePellets,   ColorOff  },
+  { Hazard_Snow,         EDisplayMode::Solid,        ColorSnow },
+  { Hazard_Rain,         EDisplayMode::Solid,        ColorRain }
+};
+
+static constexpr int HazardDisplayCount =
+  sizeof(HazardDisplayTable) / sizeof(HazardDisplayTable[0]);
+
+// ── Flight category table ───────────────────────────────────────────────────
+
+struct FFlightCategoryRow
+{
+  const char* Category; // fltCat string reported by the API
+  uint32_t    Color;    // solid color shown for that category
+};
+
+static const FFlightCategoryRow FlightCategoryTable[] = {
+  { "VFR",  ColorVFR  },
+  { "MVFR", ColorMVFR },
+  { "IFR",  ColorIFR  },
+  { "LIFR", ColorLIFR }
+};
+
+static constexpr int FlightCategoryCount =
+  sizeof(FlightCategoryTable) / sizeof(FlightCategoryTable[0]);
+
+// ── Runtime state ───────────────────────────────────────────────────────────
+
+static EDisplayMode  DisplayModes[LEDCount];
+static uint32_t      StoredColors[LEDCount];
+
+static uint8_t       BlinkStep         = 0;
+static unsigned long LastBlinkUpdate   = 0;
+static unsigned long LastWeatherUpdate = 0;
+
+// ── Display control ─────────────────────────────────────────────────────────
+
+/**
+ * Assigns a solid (non-flashing) color to one LED. Takes effect on the next
+ * renderLEDs call.
+ *
+ * @param LEDIndex  LED to set, 0..LEDCount-1. Out-of-range indices are ignored.
+ * @param Color     Packed color to store for that LED.
+ * @return None.
+ */
+static void
+setSolidDisplay(
+  int LEDIndex,
+  uint32_t Color)
+{
+  if (LEDIndex < 0 || LEDIndex >= LEDCount) {
+    return;
+  }
+  DisplayModes[LEDIndex] = EDisplayMode::Solid;
+  StoredColors[LEDIndex] = Color;
+}
+
+/**
+ * Assigns a flashing display mode to one LED. The colors and blink rate come
+ * from the mode's row in DisplayModeTable, not from the caller.
+ *
+ * @param LEDIndex  LED to set, 0..LEDCount-1. Out-of-range indices are ignored.
+ * @param Mode      Flashing mode to assign (Thunderstorm / FreezingRain / IcePellets).
+ * @return None.
+ */
+static void
+setFlashingDisplay(
+  int LEDIndex,
+  EDisplayMode Mode)
+{
+  if (LEDIndex < 0 || LEDIndex >= LEDCount) {
+    return;
+  }
+  DisplayModes[LEDIndex] = Mode;
+}
+
+/**
+ * Pushes the current display state of every LED out to the strip. Each LED's
+ * mode row in DisplayModeTable decides its color: solid modes show the
+ * per-LED stored color, flashing modes pick between the row's two colors
+ * based on BlinkStep and the row's StepDivisor.
+ *
+ * @return None.
+ */
+static void
+renderLEDs()
+{
+  for (int i = 0; i < LEDCount; i++) {
+    const FDisplayModeRow& Row =
+      DisplayModeTable[static_cast<uint8_t>(DisplayModes[i])];
+
+    uint32_t Color;
+    if (Row.bUsesStoredColor) {
+      Color = StoredColors[i];
+    }
+    else {
+      const bool bPrimaryPhase = ((BlinkStep / Row.StepDivisor) % 2) == 0;
+      Color = bPrimaryPhase ? Row.PrimaryColor : Row.SecondaryColor;
+    }
+
+    Pixels.setPixelColor(i, Color);
+  }
+
+  Pixels.show();
+}
+
+/**
+ * Advances the blink animation if BlinkInterval has elapsed and re-renders
+ * the strip. Called every loop pass so flashing LEDs keep animating between
+ * weather updates — including while a Wi-Fi attempt is in progress, since
+ * nothing in the loop blocks.
+ *
+ * @return None.
+ */
+static void
+updateBlinkingLEDs()
+{
+  const unsigned long CurrentTime = millis();
+  if (CurrentTime - LastBlinkUpdate < BlinkInterval) {
+    return;
+  }
+  LastBlinkUpdate = CurrentTime;
+  BlinkStep++;
+  renderLEDs();
+}
+
+/**
+ * Sets every LED to the dim orange error color and renders immediately.
+ * Called at the start of each weather update so any airport the API doesn't
+ * answer for is left visibly marked as missing data.
+ *
+ * @return None.
+ */
+static void
+setAllLEDsToError()
+{
+  for (int i = 0; i < LEDCount; i++) {
+    setSolidDisplay(i, ColorError);
+  }
+  renderLEDs();
+}
+
+// ── Table lookups ───────────────────────────────────────────────────────────
+
+/**
+ * Finds which LED represents an airport by searching the Airports table.
+ *
+ * @param AirportID  ICAO identifier as reported by the API (e.g. "KSAN").
+ *                   Case-insensitive; surrounding whitespace is ignored.
+ * @return int — LED index 0..LEDCount-1, or -1 if the airport is not on the board.
+ */
+static int
+findAirportLED(
+  const char* AirportID)
+{
+  if (AirportID == nullptr) {
+    return -1;
+  }
+
+  String RequestedAirport = String(AirportID);
+  RequestedAirport.trim();
+  RequestedAirport.toUpperCase();
+
+  for (int i = 0; i < LEDCount; i++) {
+    if (RequestedAirport == Airports[i]) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * Looks up the display color for a flight category in FlightCategoryTable.
+ *
+ * @param Category  Flight category string from the API ("VFR", "MVFR", "IFR",
+ *                  "LIFR"). Case-insensitive; surrounding whitespace is ignored.
+ * @return uint32_t — packed color for the category, or ColorError if the
+ *         category is null, empty, or unrecognized.
+ */
+static uint32_t
+flightCategoryColor(
+  const char* Category)
+{
+  if (Category == nullptr) {
+    return ColorError;
+  }
+
+  String CategoryText = String(Category);
+  CategoryText.trim();
+  CategoryText.toUpperCase();
+
+  for (int i = 0; i < FlightCategoryCount; i++) {
+    if (CategoryText == FlightCategoryTable[i].Category) {
+      return FlightCategoryTable[i].Color;
+    }
+  }
+
+  return ColorError;
+}
+
+// ── METAR parsing ───────────────────────────────────────────────────────────
+
+/**
+ * Extracts the next space-separated token from a string, advancing a read
+ * cursor. Shared by the hazard and wind parsers so tokenization lives in one
+ * place.
+ *
+ * @param Text           Source string to scan.
+ * @param InOutPosition  Read cursor; advanced past the returned token (and
+ *                       its trailing separator) on each call.
+ * @return String — the next token, trimmed and uppercased, or an empty
+ *         String when the source is exhausted.
+ */
+static String
+getNextToken(
+  const String& Text,
+  int& InOutPosition)
+{
+  const int TextLength = static_cast<int>(Text.length());
+
+  // Skip leading spaces.
+  while (InOutPosition < TextLength && Text.charAt(InOutPosition) == ' ') {
+    InOutPosition++;
+  }
+
+  if (InOutPosition >= TextLength) {
+    return String();
+  }
+
+  int TokenEnd = Text.indexOf(' ', InOutPosition);
+  if (TokenEnd < 0) {
+    TokenEnd = TextLength;
+  }
+
+  String Token = Text.substring(InOutPosition, TokenEnd);
+  Token.trim();
+  Token.toUpperCase();
+
+  InOutPosition = TokenEnd + 1;
+
+  return Token;
+}
+
+/**
+ * Removes the leading intensity marker (+/-) and vicinity prefix (VC) from a
+ * weather token, in place, leaving only the descriptor/precipitation codes.
+ *
+ * @param Token  Weather token to strip (e.g. "+TSRA" becomes "TSRA",
+ *               "VCTS" becomes "TS"). Modified in place.
+ * @return None.
+ */
+static void
+stripTokenPrefixes(
+  String& Token)
+{
+  if (Token.startsWith("+") || Token.startsWith("-")) {
+    Token.remove(0, 1);
+  }
+
+  if (Token.startsWith("VC")) {
+    Token.remove(0, 2);
+  }
+}
+
+/**
+ * Checks whether a two-character string is a valid METAR present-weather
+ * code by searching the ValidWeatherCodes table.
+ *
+ * @param Code  Two-letter code to test (e.g. "RA", "TS").
+ * @return bool — true if the code appears in ValidWeatherCodes.
+ */
+static bool
+isValidWeatherCode(
+  const String& Code)
+{
+  for (int i = 0; i < ValidWeatherCodeCount; i++) {
+    if (Code == ValidWeatherCodes[i]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Checks whether an entire token is a METAR weather token — i.e. after
+ * stripping the intensity/vicinity prefixes, it decomposes completely into
+ * valid two-letter weather codes (TSRA = TS + RA, SHSN = SH + SN).
+ *
+ * This whole-token validation is what stops airport IDs from reading as
+ * weather: KRAL splits into KR + AL, neither of which is a valid code, so
+ * KRAL is rejected instead of being mistaken for rain ("RA").
+ *
+ * Accepted:  -RA  +TSRA  SHSN  FZRA  VCTS
+ * Rejected:  KRAL  KCRQ  METAR  25008KT  FEW020
+ *
+ * @param Token  Candidate token from a METAR report. Passed by value; the
+ *               caller's copy is not modified.
+ * @return bool — true only if the whole token is built from valid codes.
+ */
+static bool
+isWeatherToken(
+  String Token)
+{
+  Token.trim();
+  Token.toUpperCase();
+
+  if (Token.length() == 0) {
+    return false;
+  }
+
+  stripTokenPrefixes(Token);
+
+  if (Token.length() == 0) {
+    return false;
+  }
+
+  while (Token.length() >= 2) {
+    if (!isValidWeatherCode(Token.substring(0, 2))) {
+      return false;
+    }
+    Token.remove(0, 2);
+  }
+
+  // An odd trailing character (e.g. "RAX") also fails validation.
+  return Token.length() == 0;
+}
+
+/**
+ * Converts one validated weather token into hazard flags by searching it for
+ * each substring in HazardCodeTable. Flags accumulate — "+TSRA" raises both
+ * Hazard_Thunderstorm and Hazard_Rain — and HazardDisplayTable's priority
+ * order later decides which one the LED shows.
+ *
+ * @param Token  Candidate token from a METAR report. Tokens that fail
+ *               isWeatherToken contribute no hazards. Passed by value; the
+ *               caller's copy is not modified.
+ * @return uint8_t — bitmask of EWeatherHazard flags raised by this token.
+ */
+static uint8_t
+inspectWeatherToken(
+  String Token)
+{
+  Token.trim();
+  Token.toUpperCase();
+
+  if (!isWeatherToken(Token)) {
+    return Hazard_None;
+  }
+
+  stripTokenPrefixes(Token);
+
+  uint8_t Hazards = Hazard_None;
+
+  for (int i = 0; i < HazardCodeCount; i++) {
+    if (Token.indexOf(HazardCodeTable[i].Code) >= 0) {
+      Hazards |= HazardCodeTable[i].Hazard;
+    }
+  }
+
+  return Hazards;
+}
+
+/**
+ * Scans a METAR for weather hazards, preferring the API's wxString field
+ * (which normally contains only present-weather codes) and falling back to
+ * the raw METAR text with strict whole-token validation. Stops at "RMK" so
+ * remarks can't raise hazards.
+ *
+ * @param WeatherField  wxString value from the API; may be null or empty.
+ * @param RawMETAR      rawOb value from the API; may be null or empty.
+ * @return uint8_t — bitmask of EWeatherHazard flags found across all tokens,
+ *         or Hazard_None if both inputs are empty.
+ */
+static uint8_t
+parseWeatherHazards(
+  const char* WeatherField,
+  const char* RawMETAR)
+{
+  String WeatherText;
+
+  if (WeatherField != nullptr && WeatherField[0] != '\0') {
+    WeatherText = String(WeatherField);
+  }
+  else if (RawMETAR != nullptr && RawMETAR[0] != '\0') {
+    WeatherText = String(RawMETAR);
+  }
+  else {
+    return Hazard_None;
+  }
+
+  uint8_t Hazards  = Hazard_None;
+  int     Position = 0;
+
+  while (true) {
+    const String Token = getNextToken(WeatherText, Position);
+
+    if (Token.length() == 0) {
+      break;
+    }
+
+    // Ignore remarks after RMK.
+    if (Token == "RMK") {
+      break;
+    }
+
+    Hazards |= inspectWeatherToken(Token);
+  }
+
+  return Hazards;
+}
+
+/**
+ * Parses an unsigned integer from a fixed-width slice of a string, stopping
+ * at the first non-digit character.
+ *
+ * @param Text                Source string.
+ * @param StartPosition       Index of the first character to read.
+ * @param NumberOfCharacters  Maximum characters to consume.
+ * @return int — the parsed value, or 0 if no digit was found at StartPosition.
+ */
+static int
+parseDigits(
+  const String& Text,
+  int StartPosition,
+  int NumberOfCharacters)
+{
+  int  Value       = 0;
+  bool bFoundDigit = false;
+
+  const int EndPosition = min(StartPosition + NumberOfCharacters, static_cast<int>(Text.length()));
+
+  for (int i = StartPosition; i < EndPosition; i++) {
+    const char Character = Text.charAt(i);
+
+    if (Character < '0' || Character > '9') {
+      break;
+    }
+
+    Value = Value * 10 + (Character - '0');
+    bFoundDigit = true;
+  }
+
+  return bFoundDigit ? Value : 0;
+}
+
+/**
+ * Extracts sustained and gust wind speeds from a raw METAR's wind token,
+ * used as a fallback when the API's numeric wind fields are unavailable.
+ *
+ * Recognized token forms: 25012KT, 25012G30KT, VRB05KT.
+ *
+ * @param RawMETAR       rawOb value from the API; may be null or empty.
+ * @param SustainedWind  Out — sustained wind in knots. Only written when a
+ *                       wind token is found.
+ * @param GustWind       Out — gust wind in knots. Only written when the
+ *                       token carries a gust group ("G").
+ * @return None.
+ */
+static void
+parseWindFromRawMETAR(
+  const char* RawMETAR,
+  int& SustainedWind,
+  int& GustWind)
+{
+  if (RawMETAR == nullptr || RawMETAR[0] == '\0') {
+    return;
+  }
+
+  const String METARText = String(RawMETAR);
+  int Position = 0;
+
+  while (true) {
+    String Token = getNextToken(METARText, Position);
+
+    if (Token.length() == 0) {
+      break;
+    }
+
+    if (!Token.endsWith("KT")) {
+      continue;
+    }
+
+    Token.remove(Token.length() - 2); // strip "KT"
+
+    // Shortest valid form is dddff (3-digit direction + 2-digit speed).
+    if (Token.length() < 5) {
+      continue;
+    }
+
+    const int GustPosition = Token.indexOf('G');
+
+    if (GustPosition >= 0) {
+      SustainedWind = parseDigits(Token, 3, GustPosition - 3);
+      GustWind      = parseDigits(
+        Token, GustPosition + 1, Token.length() - GustPosition - 1);
+    }
+    else {
+      SustainedWind = parseDigits(Token, 3, Token.length() - 3);
+    }
+
+    return;
+  }
+}
+
+// ── Airport display assignment ──────────────────────────────────────────────
+
+/**
+ * Decides what one airport's LED should show from its parsed METAR data and
+ * assigns it. Walks HazardDisplayTable top to bottom — the first row whose
+ * hazard flag is set wins — then falls through to the wind-alert threshold,
+ * then to the flight-category color.
+ *
+ * @param LEDIndex        LED for this airport, 0..LEDCount-1.
+ * @param FlightCategory  fltCat string from the API; may be null or empty.
+ * @param WeatherField    wxString value from the API; may be null or empty.
+ * @param RawMETAR        rawOb value from the API; may be null or empty.
+ * @param SustainedWind   Sustained wind in knots from the API (0 if absent).
+ * @param GustWind        Gust wind in knots from the API (0 if absent).
+ * @return None.
+ */
+static void assignAirportDisplay(
+  int LEDIndex,
+  const char* FlightCategory,
+  const char* WeatherField,
+  const char* RawMETAR,
+  int SustainedWind,
+  int GustWind)
+{
+  const uint8_t Hazards = parseWeatherHazards(WeatherField, RawMETAR);
+
+  // If the API wind values are unavailable, parse the raw METAR wind token.
+  if (SustainedWind <= 0 && GustWind <= 0) {
+    parseWindFromRawMETAR(RawMETAR, SustainedWind, GustWind);
+  }
+
+  // Highest-priority hazard row wins.
+  for (int i = 0; i < HazardDisplayCount; i++) {
+    const FHazardDisplayRow& Row = HazardDisplayTable[i];
+
+    if ((Hazards & Row.Hazard) == 0) {
+      continue;
+    }
+
+    if (Row.Mode == EDisplayMode::Solid) {
+      setSolidDisplay(LEDIndex, Row.SolidColor);
+    }
+    else {
+      setFlashingDisplay(LEDIndex, Row.Mode);
+    }
+
+    return;
+  }
+
+  if (SustainedWind >= WindAlertKnots || GustWind >= WindAlertKnots) {
+    setSolidDisplay(LEDIndex, ColorWind);
+    return;
+  }
+
+  setSolidDisplay(LEDIndex, flightCategoryColor(FlightCategory));
+}
+
+// ── Wi-Fi connection state machine ──────────────────────────────────────────
+// Non-blocking: startWiFiConnection begins an attempt and returns
+// immediately; updateWiFiConnection is polled from loop() to advance the
+// state, so the blink animation keeps running while the radio associates.
+
+enum class EWiFiState : uint8_t
+{
+  Disconnected, // no link and no attempt in progress
+  Connecting,   // WiFi.begin issued; waiting for the link or the timeout
+  Connected     // link is up
+};
+
+static EWiFiState    WiFiState        = EWiFiState::Disconnected;
+static unsigned long WiFiConnectStart = 0;
+
+/**
+ * Starts a non-blocking Wi-Fi connection attempt and stamps the timeout
+ * clock. Safe to call while an attempt is already in progress; the attempt
+ * is simply restarted with a fresh timeout.
+ *
+ * @return None.
+ */
+static void
+startWiFiConnection()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WiFiName, WiFiPassword);
+
+  WiFiConnectStart = millis();
+  WiFiState        = EWiFiState::Connecting;
+}
+
+/**
+ * Advances the Wi-Fi state machine one step without blocking: promotes
+ * Connecting to Connected when the link comes up, fails the attempt back to
+ * Disconnected once WiFiConnectTimeout elapses, and demotes Connected to
+ * Disconnected if an established link drops.
+ *
+ * @return EWiFiState — the state after this poll.
+ */
+static EWiFiState
+updateWiFiConnection()
+{
+  switch (WiFiState) {
+    case EWiFiState::Disconnected:
+      break;
+
+    case EWiFiState::Connecting:
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFiState = EWiFiState::Connected;
+      }
+      else if (millis() - WiFiConnectStart >= WiFiConnectTimeout) {
+        WiFi.disconnect();
+        WiFiState = EWiFiState::Disconnected;
+      }
+      break;
+
+    case EWiFiState::Connected:
+      if (WiFi.status() != WL_CONNECTED) {
+        WiFiState = EWiFiState::Disconnected;
+      }
+      break;
+  }
+
+  return WiFiState;
+}
+
+// ── Weather download ────────────────────────────────────────────────────────
+
+/**
+ * Downloads current METARs for every airport in the Airports table in one
+ * batched aviationweather.gov request and assigns each LED's display.
+ * Wi-Fi must already be up — the weather state machine only calls this once
+ * updateWiFiConnection reports Connected.
+ *
+ * The HTTP exchange itself is blocking (HTTPClient has no async API), but
+ * it is bounded by its 20-second timeout and runs at most once per
+ * WeatherUpdateInterval.
+ *
+ * @return None.
+ */
+static void
+fetchAirportWeather()
+{
+  // Build the comma-separated ID list from the airport table.
+  String AirportList;
+  AirportList.reserve(LEDCount * 5);
+
+  for (int i = 0; i < LEDCount; i++) {
+    if (i > 0) {
+      AirportList += ",";
+    }
+
+    AirportList += Airports[i];
+  }
+
+  const String RequestURL =
+    "https://aviationweather.gov/api/data/metar?ids=" +
+    AirportList + "&format=json";
+
+  // setInsecure skips certificate validation — acceptable here because the
+  // payload is public weather data and the ESP32 has no CA bundle.
+  WiFiClientSecure SecureClient;
+  SecureClient.setInsecure();
+
+  HTTPClient HTTPS;
+
+  if (!HTTPS.begin(SecureClient, RequestURL)) { return; }
+
+  HTTPS.setTimeout(20000);
+  HTTPS.addHeader("User-Agent", "ESP32-Airport-Weather-Map");
+
+  const int ResponseCode = HTTPS.GET();
+
+  if (ResponseCode != HTTP_CODE_OK) {
+    HTTPS.end();
+    return;
+  }
+
+  JsonDocument Document;
+
+  const DeserializationError JSONError =
+    deserializeJson(Document, HTTPS.getStream());
+
+  if (JSONError || !Document.is<JsonArray>()) {
+    HTTPS.end();
+    return;
+  }
+
+  for (JsonObject Report : Document.as<JsonArray>()) {
+    const char* AirportID = Report["icaoId"] | "";
+
+    const int LEDIndex = findAirportLED(AirportID);
+    if (LEDIndex < 0) {
+      continue;
+    }
+
+    const char* FlightCategory = Report["fltCat"]   | "";
+    const char* WeatherField   = Report["wxString"] | "";
+    const char* RawMETAR       = Report["rawOb"]    | "";
+    const int   SustainedWind  = Report["wspd"]     | 0;
+    const int   GustWind       = Report["wgst"]     | 0;
+
+    assignAirportDisplay(
+      LEDIndex,
+      FlightCategory,
+      WeatherField,
+      RawMETAR,
+      SustainedWind,
+      GustWind);
+  }
+
+  HTTPS.end();
+
+  renderLEDs();
+}
+
+// ── Weather update state machine ────────────────────────────────────────────
+// Drives the periodic update cycle from loop() without blocking: a request
+// paints the board with the error color and kicks off Wi-Fi; the download
+// happens on a later loop pass, once the Wi-Fi state machine reports a link.
+
+enum class EWeatherUpdateState : uint8_t
+{
+  Idle,          // waiting for the next WeatherUpdateInterval to elapse
+  WaitingForWiFi // update requested; waiting on the Wi-Fi state machine
+};
+
+static EWeatherUpdateState WeatherUpdateState = EWeatherUpdateState::Idle;
+
+/**
+ * Begins a weather update cycle: sets every LED to the error color (so
+ * airports with no data stay visibly marked), starts a Wi-Fi attempt if the
+ * link isn't already up, and hands off to updateWeatherStateMachine to
+ * finish the cycle once the connection resolves.
+ *
+ * @return None.
+ */
+static void
+requestWeatherUpdate()
+{
+  setAllLEDsToError();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    startWiFiConnection();
+  }
+  else {
+    WiFiState = EWiFiState::Connected;
+  }
+
+  WeatherUpdateState = EWeatherUpdateState::WaitingForWiFi;
+}
+
+/**
+ * Advances the weather update cycle one step without blocking. Idle starts a
+ * new cycle every WeatherUpdateInterval; WaitingForWiFi polls the Wi-Fi
+ * state machine and either downloads the weather (link came up) or abandons
+ * the cycle until the next interval (attempt timed out — the LEDs stay dim
+ * orange). Called every loop() pass.
+ *
+ * @return None.
+ */
+static void
+updateWeatherStateMachine()
+{
+  switch (WeatherUpdateState) {
+    case EWeatherUpdateState::Idle:
+      if (millis() - LastWeatherUpdate >= WeatherUpdateInterval) {
+        requestWeatherUpdate();
+      }
+      break;
+
+    case EWeatherUpdateState::WaitingForWiFi:
+      switch (updateWiFiConnection()) {
+        case EWiFiState::Connected:
+          fetchAirportWeather();
+          LastWeatherUpdate  = millis();
+          WeatherUpdateState = EWeatherUpdateState::Idle;
+          break;
+
+        case EWiFiState::Disconnected: // attempt timed out; retry next interval
+          LastWeatherUpdate  = millis();
+          WeatherUpdateState = EWeatherUpdateState::Idle;
+          break;
+
+        case EWiFiState::Connecting: // still associating; check again next pass
+          break;
+      }
+      break;
+  }
+}
+
+// ── Startup ─────────────────────────────────────────────────────────────────
+
+/**
+ * Runs a visual power-on self test: chases a single turquoise pixel down the
+ * strip so a dead LED or wiring fault is obvious before real data arrives.
+ *
+ * @return None.
+ */
+static void
+runStartupTest()
+{
+  for (int i = 0; i < LEDCount; i++) {
+    Pixels.clear();
+    Pixels.setPixelColor(i, ColorRain);
+    Pixels.show();
+    delay(120);
+  }
+
+  Pixels.clear();
+  Pixels.show();
+}
+
+/**
+ * Arduino entry point (name is fixed by the framework). Initializes the LED
+ * strip, resets every LED to solid off, runs the startup test, and requests
+ * the first weather update — the state machines in loop() complete it.
+ *
+ * @return None.
+ */
+void
+setup()
+{
+  Pixels.begin();
+  Pixels.setBrightness(LEDBrightness);
+  Pixels.clear();
+  Pixels.show();
+
+  for (int i = 0; i < LEDCount; i++) {
+    DisplayModes[i] = EDisplayMode::Solid;
+    StoredColors[i] = ColorOff;
+  }
+  runStartupTest();
+  requestWeatherUpdate();
+  LastBlinkUpdate = millis();
+}
+
+/**
+ * Arduino main loop (name is fixed by the framework). Advances the blink
+ * animation and the weather/Wi-Fi state machines every pass; nothing here
+ * blocks, so flashing LEDs stay smooth while the radio associates.
+ *
+ * @return None.
+ */
+void
+loop()
+{
+  updateBlinkingLEDs();
+  updateWeatherStateMachine();
+}
