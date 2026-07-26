@@ -10,6 +10,6 @@ Controller:
     
     800 kHz timing
 
-  Required libraries:
+  Required Arduino libraries:
     1. Adafruit NeoPixel
     2. ArduinoJson version 7
